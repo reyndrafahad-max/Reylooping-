@@ -1,0 +1,17 @@
+{
+  "id": "./",
+  "name": "Reylooping",
+  "short_name": "Reylooping",
+  "description": "Reylooping, Seamless Video Loop Editor. Sambung ujung dan awal video jadi loop tanpa jeda, langsung di HP.",
+  "lang": "id",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F4F5FF",
+  "theme_color": "#F4F5FF",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
