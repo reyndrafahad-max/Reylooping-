@@ -480,7 +480,7 @@
   <div class="body">
     <p class="note lockmsg">Pilih video dulu di kartu Video.</p>
     <label class="fld"><span>Panjang file hasil</span><select id="len"></select></label>
-    <p class="note">Menyimpan berjalan real-time, jadi butuh waktu sepanjang file hasil. Selama itu biarkan layar menyala dan jangan pindah aplikasi.</p>
+    <p class="note">Yang direkam paling lama 1 menit. Pilihan yang lebih panjang dibuat dengan menggandakan hasil rekaman di dalam file, jadi cepat dan kualitasnya sama. Ukurannya besar, sekitar 2,7 GB per jam. Kalau gagal diunduh, pilih yang lebih pendek. Saat merekam, biarkan layar menyala dan jangan pindah aplikasi.</p>
     <div id="result" class="hidden">
       <video id="out" controls playsinline loop></video>
       <p class="note" id="outInfo"></p>
@@ -635,16 +635,22 @@
 
   let url = null, D = 0, vw = 0, vh = 0, baseName = 'video';
   const st = { S: 0, E: 0, d: 4, dEff: 4, mute: false, res: 720, len: 60 };
-  function cyclesFor(L) { return st.len ? Math.max(1, Math.ceil(st.len / L)) : 1; }
+  const REC_CAP = 60;   // paling lama merekam; sisanya digandakan di dalam file
+  const fmtLong = x => {
+    const h = Math.floor(x / 3600), m = Math.floor((x % 3600) / 60), d = Math.round(x % 60);
+    return h ? h + ' jam ' + m + ' mnt' : m ? m + ' mnt ' + d + ' dtk' : fmt(x);
+  };
+  function recCycles(L, len) { len = len === undefined ? st.len : len; return Math.max(1, Math.ceil(Math.min(len || L, REC_CAP) / L)); }
+  function repeatFor(L, len) { len = len === undefined ? st.len : len; return len > REC_CAP ? Math.ceil(len / (recCycles(L, len) * L)) : 1; }
   function updateLenOptions(L) {
     const sel = $('len');
     sel.innerHTML = '';
-    [0, 30, 60, 120].forEach(v => {
-      const n = v ? Math.max(1, Math.ceil(v / L)) : 1;
+    [0, 30, 60, 600, 1800, 3600].forEach(v => {
+      const rc = recCycles(L, v), R = repeatFor(L, v);
       const o = document.createElement('option');
       o.value = v;
-      const name = v === 0 ? 'Satu putaran' : v >= 120 ? 'Sekitar 2 menit' : 'Sekitar ' + v + ' detik';
-      o.textContent = name + ' (' + n + ' putaran, ' + fmt(n * L) + ')';
+      const name = v === 0 ? 'Satu putaran' : v === 60 ? 'Sekitar 1 menit' : v >= 3600 ? 'Sekitar 1 jam' : v >= 600 ? 'Sekitar ' + (v / 60) + ' menit' : 'Sekitar ' + v + ' detik';
+      o.textContent = name + (R > 1 ? ' (rekam ' + fmt(rc * L) + ', gandakan ' + R + 'x)' : ' (' + rc + ' putaran, ' + fmt(rc * L) + ')');
       if (v === st.len) o.selected = true;
       sel.appendChild(o);
     });
@@ -890,7 +896,7 @@ function mp4Parser(u8) {
 
 // Menyusun ulang MP4 fragmen (hasil MediaRecorder) jadi MP4 biasa dengan durasi benar.
 // Hanya membaca kotak kecil (ftyp, moov, moof); isi mdat tidak disalin ke memori.
-async function fixMp4Blob(blob) {
+async function fixMp4Blob(blob, repeat = 1, targetSec = 0) {
   const size = blob.size;
   const rd = async (a, b) => new Uint8Array(await blob.slice(a, b).arrayBuffer());
   let o = 0, ftypB = null, moovB = null; const moofs = [], mdats = [];
@@ -984,37 +990,62 @@ async function fixMp4Blob(blob) {
     if (ver) d.setBigUint64(off, BigInt(value)); else d.setUint32(off, value);
   };
   const mvTs = pm.u32(mvhd.start + mvhd.hs + 4 + (moovB[mvhd.start + mvhd.hs] ? 16 : 8));
+  const nSamples = tracks.reduce((a2, t) => a2 + t.samples.length, 0), nChunks = tracks.reduce((a2, t) => a2 + t.chunks.length, 0);
+  // Batas 4 GB (kolom 32-bit): kurangi pengulangan kalau kebanyakan
+  const maxR = Math.max(1, Math.floor((0xffffffff - 2e6) / (cum + 4 * (nSamples + nChunks) + 64)));
+  const baseDur = Math.max(...tracks.map(t => t.samples.reduce((a2, s2) => a2 + s2.dur, 0) / t.ts)) || 1;
+  const want = targetSec > 0 ? Math.ceil(targetSec / baseDur) : repeat;   // pas atau sedikit melebihi panjang yang diminta
+  const R = Math.max(1, Math.min(Math.floor(want) || 1, maxR));
   tracks.forEach(t => {
-    t.mediaDur = t.samples.reduce((a, s) => a + s.dur, 0);
+    t.mediaDur = t.samples.reduce((a2, s) => a2 + s.dur, 0) * R;
     t.movieDur = Math.round(t.mediaDur * mvTs / t.ts);
   });
   const movieDur = Math.max(...tracks.map(t => t.movieDur));
+  const U32a = arr => { const out = new Uint8Array(arr.length * 4); const d = new DataView(out.buffer); for (let i = 0; i < arr.length; i++) d.setUint32(i * 4, arr[i] >>> 0); return out; };
+  const rle = (pairs, times) => {
+    const out = [];
+    for (let k = 0; k < times; k++) for (const e of pairs) { const l = out[out.length - 1]; if (l && l[1] === e[1]) l[0] += e[0]; else out.push([e[0], e[1]]); }
+    return out;
+  };
 
   function buildTrack(t, baseOff) {
     const tkhd = slice(t.tkhd); setDur(tkhd, t.tkhd.hs, moovB[t.tkhd.start + t.tkhd.hs], 8, t.movieDur);
     const mdhd = slice(t.mdhd); setDur(mdhd, t.mdhd.hs, moovB[t.mdhd.start + t.mdhd.hs], 4, t.mediaDur);
-    const S = t.samples;
-    const stts = []; S.forEach(s => { const l = stts[stts.length - 1]; if (l && l[1] === s.dur) l[0]++; else stts.push([1, s.dur]); });
-    const sttsB = mk('stts', U32(0, stts.length), cat(stts.map(e => U32(e[0], e[1]))));
+    const S = t.samples, n = S.length;
+    const d1 = []; S.forEach(s => { const l = d1[d1.length - 1]; if (l && l[1] === s.dur) l[0]++; else d1.push([1, s.dur]); });
+    const stts = rle(d1, R);
+    const sttsB = mk('stts', U32(0, stts.length), U32a(stts.flat()));
     let cttsB = new Uint8Array(0);
     if (S.some(s => s.cto !== 0)) {
-      const neg = S.some(s => s.cto < 0); const c = [];
-      S.forEach(s => { const l = c[c.length - 1]; if (l && l[1] === s.cto) l[0]++; else c.push([1, s.cto]); });
-      cttsB = mk('ctts', U32(neg ? 0x01000000 : 0, c.length), cat(c.map(e => cat([U32(e[0]), I32(e[1])]))));
+      const neg = S.some(s => s.cto < 0); const c1 = [];
+      S.forEach(s => { const l = c1[c1.length - 1]; if (l && l[1] === s.cto) l[0]++; else c1.push([1, s.cto]); });
+      const c = rle(c1, R); const body = new Uint8Array(c.length * 8); const dvb = new DataView(body.buffer);
+      c.forEach((e, i) => { dvb.setUint32(i * 8, e[0]); dvb.setInt32(i * 8 + 4, e[1]); });
+      cttsB = mk('ctts', U32(neg ? 0x01000000 : 0, c.length), body);
     }
     let stssB = new Uint8Array(0);
     const sync = []; S.forEach((s, i) => { if (!(s.flg & 0x10000)) sync.push(i + 1); });
-    if (sync.length && sync.length < S.length) stssB = mk('stss', U32(0, sync.length), U32(...sync));
-    const stszB = mk('stsz', U32(0, 0, S.length), U32(...S.map(s => s.size)));
-    const sc = []; t.chunks.forEach((c, i) => { const l = sc[sc.length - 1]; if (l && l[1] === c.count) return; sc.push([i + 1, c.count]); });
-    const stscB = mk('stsc', U32(0, sc.length), cat(sc.map(e => U32(e[0], e[1], 1))));
-    const offs = t.chunks.map(c => {
+    if (sync.length && sync.length < n) {
+      const all = new Uint32Array(sync.length * R);
+      for (let k = 0; k < R; k++) for (let i = 0; i < sync.length; i++) all[k * sync.length + i] = sync[i] + k * n;
+      stssB = mk('stss', U32(0, all.length), U32a(all));
+    }
+    const sizes = new Uint32Array(n * R);
+    for (let k = 0; k < R; k++) for (let i = 0; i < n; i++) sizes[k * n + i] = S[i].size;
+    const stszB = mk('stsz', U32(0, 0, sizes.length), U32a(sizes));
+    const sc = []; let ci = 0;
+    for (let k = 0; k < R; k++) for (const c of t.chunks) { ci++; const l = sc[sc.length - 1]; if (l && l[1] === c.count) continue; sc.push([ci, c.count]); }
+    const scFlat = []; sc.forEach(e => scFlat.push(e[0], e[1], 1));
+    const stscB = mk('stsc', U32(0, sc.length), U32a(scFlat));
+    const base1 = t.chunks.map(c => {
       const m = mdats.find(x => c.off >= x.ps && c.off < x.pe + 1);
-      return baseOff + m.ns + (c.off - m.ps);
+      return m.ns + (c.off - m.ps);
     });
-    const stcoB = mk('stco', U32(0, offs.length), U32(...offs));
+    const offs = new Uint32Array(base1.length * R);
+    for (let k = 0; k < R; k++) for (let i = 0; i < base1.length; i++) offs[k * base1.length + i] = baseOff + k * cum + base1[i];
+    const stcoB = mk('stco', U32(0, offs.length), U32a(offs));
     const stbl = mk('stbl', slice(t.stsd), sttsB, cttsB, stssB, stscB, stszB, stcoB);
-    const minfKids = pm.kids(t.minf).filter(b => b.type !== 'stbl').map(slice);
+    const minfKids = pm.kids(t.minf).filter(b2 => b2.type !== 'stbl').map(slice);
     const minf = mk('minf', ...minfKids, stbl);
     const mdia = mk('mdia', mdhd, slice(t.hdlr), minf);
     return mk('trak', tkhd, mdia);
@@ -1024,15 +1055,16 @@ async function fixMp4Blob(blob) {
     return mk('moov', mh, ...tracks.map(t => buildTrack(t, baseOff)));
   }
   const moovLen = buildMoov(0).length;
-  const payload = cum;
+  const payload = cum * R;
   if (ftypB.length + moovLen + 8 + payload > 0xffffffff) return null;
   const baseOff = ftypB.length + moovLen + 8;
   const mdatHead = new Uint8Array(8); new DataView(mdatHead.buffer).setUint32(0, 8 + payload);
   'mdat'.split('').forEach((c, i) => mdatHead[4 + i] = c.charCodeAt(0));
   const head = cat([ftypB, buildMoov(baseOff), mdatHead]);
+  const one = new Blob(mdats.map(m => blob.slice(m.ps, m.pe)));
   const parts = [head];
-  mdats.forEach(m => parts.push(blob.slice(m.ps, m.pe)));
-  return { blob: new Blob(parts, { type: 'video/mp4' }), duration: movieDur / mvTs };
+  for (let k = 0; k < R; k++) parts.push(one);
+  return { blob: new Blob(parts, { type: 'video/mp4' }), duration: movieDur / mvTs, repeat: R };
 }
   window.__rl = { fixMp4Blob };
 
@@ -1049,7 +1081,7 @@ async function fixMp4Blob(blob) {
     if (mime) opts.mimeType = mime;
     const recorder = new MediaRecorder(stream, opts);
     const chunks = [];
-    rec = { recorder, chunks, active: true, cancelled: false, done: 0, target: cyclesFor(st.E - (st.S + st.dEff)), mime: recorder.mimeType || mime || 'video/webm' };
+    rec = { recorder, chunks, active: true, cancelled: false, done: 0, target: recCycles(st.E - (st.S + st.dEff)), repeat: repeatFor(st.E - (st.S + st.dEff)), lenSec: st.len > REC_CAP ? st.len : 0, mime: recorder.mimeType || mime || 'video/webm' };
     recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
     recorder.onstop = () => onRecStop(rec);
     recorder.start(1000);
@@ -1076,11 +1108,11 @@ async function fixMp4Blob(blob) {
     if (!r || r.cancelled) return;
     let blob = new Blob(r.chunks, { type: r.mime.split(';')[0] });
     const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
-    let fixedDur = null;
+    let fixedDur = null, usedRep = 1;
     if (ext === 'mp4') {
       try {
-        const res = await fixMp4Blob(blob);
-        if (res) { blob = res.blob; fixedDur = res.duration; }
+        const res = await fixMp4Blob(blob, r.repeat || 1, r.lenSec || 0);
+        if (res) { blob = res.blob; fixedDur = res.duration; usedRep = res.repeat; }
       } catch (e) { fixedDur = null; }
     }
     if (outUrl) URL.revokeObjectURL(outUrl);
@@ -1090,12 +1122,16 @@ async function fixMp4Blob(blob) {
     $('out').src = outUrl;
     $('out').play().catch(() => {});
     $('result').classList.remove('hidden');
-    const mb = (blob.size / 1048576).toFixed(1).replace('.', ',');
+    const mb = blob.size >= 1073741824 ? (blob.size / 1073741824).toFixed(2).replace('.', ',') + ' GB' : (blob.size / 1048576).toFixed(1).replace('.', ',') + ' MB';
     let note = '';
-    if (ext === 'webm') note = ' Format WebM: durasinya belum bisa diperbaiki dan sering tidak terbaca editor. Rekam lewat Chrome terbaru agar hasilnya MP4.';
-    else if (fixedDur) note = ' Durasi tercatat di file: ' + fmt(fixedDur) + '.';
+    if (ext === 'webm') note = ' Format WebM: durasinya belum bisa diperbaiki dan sering tidak terbaca editor. Rekam lewat Chrome terbaru agar hasilnya MP4.' + ((r.repeat || 1) > 1 ? ' Penggandaan hanya bisa untuk MP4, jadi hasilnya sepanjang rekaman.' : '');
+    else if (fixedDur) {
+      note = ' Durasi tercatat di file: ' + fmtLong(fixedDur) + '.';
+      if (usedRep > 1) note += ' Dibuat dari rekaman yang digandakan ' + usedRep + ' kali tanpa dikodekan ulang.';
+      if (usedRep < (r.repeat || 1)) note += ' Dipotong sampai batas ukuran 4 GB.';
+    }
     else note = ' Durasi file tidak berhasil diperbaiki, jadi editor bisa salah membacanya.';
-    $('outInfo').textContent = 'Hasil: ' + outFile.name + ', ' + mb + ' MB.' + note + ' Pratinjau ini berputar terus, cek apakah sambungannya sudah halus.';
+    $('outInfo').textContent = 'Hasil: ' + outFile.name + ', ' + mb + '.' + note + ' Pratinjau ini berputar terus, cek apakah sambungannya sudah halus.';
     setStatus('Selesai. Cek hasilnya di bawah.');
     if (rec === r) rec = null;
     ui();
@@ -1370,6 +1406,7 @@ async function fixMp4Blob(blob) {
 (() => {
   const $ = id => document.getElementById(id);
   const MAXS = 600;
+  const LEAD = 0.25;
   const mA = $('mA'), mB = $('mB'), mC = $('mC');
   const fmtSec = x => x.toFixed(1).replace('.', ',') + ' dtk';
   const fmtDur = s => { const m = Math.floor(s / 60), r = Math.round(s % 60); return m ? m + ' mnt ' + r + ' dtk' : r + ' dtk'; };
@@ -1519,7 +1556,12 @@ async function fixMp4Blob(blob) {
       r.node = ctx.createBufferSource(); r.node.buffer = abuf; r.node.loop = true; r.node.connect(dest);
       await Promise.all([seek(mA, 0), seek(mB, 0)]);
       if (r.cancelled) return;
-      const stream = cv.captureStream(30);
+      // Ambil gambar tepat saat video menampilkan frame baru (bukan tiap sekian milidetik),
+      // supaya tidak ada frame ganda atau terlewat. Cadangan: cara lama kalau browser belum mendukung.
+      r.manual = 'requestVideoFrameCallback' in HTMLVideoElement.prototype
+        && typeof CanvasCaptureMediaStreamTrack !== 'undefined' && 'requestFrame' in CanvasCaptureMediaStreamTrack.prototype;
+      const stream = cv.captureStream(r.manual ? 0 : 30);
+      r.track = stream.getVideoTracks()[0];
       dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
       const mime = pickMime();
       const opts = { videoBitsPerSecond: Number($('mRes').value) >= 1080 ? 8e6 : 5e6 };
@@ -1531,16 +1573,36 @@ async function fixMp4Blob(blob) {
       await mA.play();
       g.drawImage(mA, 0, 0, cv.width, cv.height);
       rec.start(1000);
+      if (r.manual) r.track.requestFrame();
       r.node.start();
       r.tStart = ctx.currentTime;
+      r.lead = LEAD;
+      r.lastDraw = 0;
+      const grab = v => {
+        g.drawImage(v, 0, 0, cv.width, cv.height); r.track.requestFrame();
+        r.lastDraw = performance.now();
+      };
+      r.grab = grab;
+      const pump = v => {
+        const cb = () => {
+          if (run !== r || r.cancelled) return;
+          if (v === r.cur) { grab(v); }
+          else if (r.armed && !r.lat) r.lat = performance.now() - r.armAt;
+          v.requestVideoFrameCallback(cb);
+        };
+        v.requestVideoFrameCallback(cb);
+      };
+      if (r.manual) { pump(mA); pump(mB); }
       await lockScreen(r);
       const D = vmeta.dur;
       const tick = () => {
         if (run !== r || r.cancelled) return;
         const cur = r.cur, oth = r.oth, t = cur.currentTime;
-        g.drawImage(cur, 0, 0, cv.width, cv.height);
-        if (!r.armed && t >= D - 0.1) { r.armed = true; oth.play().catch(() => {}); }
+        if (!r.manual) g.drawImage(cur, 0, 0, cv.width, cv.height);
+        else if (performance.now() - r.lastDraw > 40) r.grab(cur);
+        if (!r.armed && t >= D - r.lead) { r.armed = true; r.lat = 0; r.armAt = performance.now(); oth.play().catch(() => {}); }
         if (t >= D - 0.02 || cur.ended) {
+          if (r.lat) r.lead = Math.min(0.5, Math.max(0.06, r.lat / 1000 + 0.03));
           r.cur = oth; r.oth = cur; cur.pause(); cur.currentTime = 0; r.armed = false;
           if (r.cur.paused) r.cur.play().catch(() => {});
         } else if (cur.paused) cur.play().catch(() => {});
